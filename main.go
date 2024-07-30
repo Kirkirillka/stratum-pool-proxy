@@ -7,7 +7,13 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"net/http"
+	"os"
 	"sync"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type Pool struct {
@@ -19,9 +25,22 @@ type Config struct {
 	Pools []Pool `json:"pools"`
 }
 
-var config Config
-var poolConnections map[string]net.Conn
-var mutex sync.Mutex
+var (
+	config    Config
+	poolUsage = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "stratum_proxy_pool_usage_total",
+			Help: "Total number of connections to each pool",
+		},
+		[]string{"pool"},
+	)
+	logMessages bool
+)
+
+func init() {
+	prometheus.MustRegister(poolUsage)
+	logMessages = os.Getenv("LOG_MESSAGES") == "true"
+}
 
 func loadConfig() error {
 	data, err := ioutil.ReadFile("config.json")
@@ -47,66 +66,77 @@ func selectPool() string {
 }
 
 func handleClient(clientConn net.Conn) {
+	defer clientConn.Close()
 	poolAddress := selectPool()
 	log.Printf("Forwarding connection to: %s", poolAddress)
 
-	mutex.Lock()
-	poolConn, exists := poolConnections[poolAddress]
-	if !exists {
-		var err error
-		poolConn, err = net.Dial("tcp", poolAddress)
-		if err != nil {
-			log.Printf("Failed to connect to pool %s: %v", poolAddress, err)
-			clientConn.Close()
-			mutex.Unlock()
-			return
-		}
-		poolConnections[poolAddress] = poolConn
+	poolUsage.WithLabelValues(poolAddress).Inc()
+
+	poolConn, err := net.Dial("tcp", poolAddress)
+	if err != nil {
+		log.Printf("Failed to connect to pool %s: %v", poolAddress, err)
+		return
 	}
-	mutex.Unlock()
+	defer poolConn.Close()
 
 	var wg sync.WaitGroup
 	wg.Add(2)
 
 	go func() {
 		defer wg.Done()
-		defer clientConn.Close()
-		ioCopyWithLogging(clientConn, poolConn)
+		if err := transferData(clientConn, poolConn, "client_to_pool"); err != nil {
+			log.Printf("Error transferring data from client to pool: %v", err)
+		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		defer clientConn.Close()
-		ioCopyWithLogging(poolConn, clientConn)
+		if err := transferData(poolConn, clientConn, "pool_to_client"); err != nil {
+			log.Printf("Error transferring data from pool to client: %v", err)
+		}
 	}()
 
 	wg.Wait()
-
-	mutex.Lock()
-	if poolConn != nil {
-		poolConn.Close()
-		delete(poolConnections, poolAddress)
-	}
-	mutex.Unlock()
 }
 
-func ioCopyWithLogging(dst net.Conn, src net.Conn) {
-	_, err := io.Copy(dst, src)
-	if err != nil {
-		if err == io.EOF {
-			log.Printf("Connection closed by %v", src.RemoteAddr())
-		} else {
-			log.Printf("Error copying data from %v to %v: %v", src.RemoteAddr(), dst.RemoteAddr(), err)
+func transferData(src net.Conn, dst net.Conn, direction string) error {
+	buffer := make([]byte, 1024)
+	for {
+		n, err := src.Read(buffer)
+		if err != nil {
+			if err != io.EOF {
+				return err
+			}
+			break
+		}
+		if logMessages {
+			logData := map[string]interface{}{
+				"direction": direction,
+				"bytes":     n,
+				"message":   string(buffer[:n]),
+			}
+			logDataJSON, _ := json.Marshal(logData)
+			log.Println(string(logDataJSON))
+		}
+		if _, err := dst.Write(buffer[:n]); err != nil {
+			return err
 		}
 	}
+	return nil
 }
 
 func main() {
+	rand.Seed(time.Now().UnixNano())
+
 	if err := loadConfig(); err != nil {
 		log.Fatalf("Failed to load config: %v", err)
 	}
 
-	poolConnections = make(map[string]net.Conn)
+	go func() {
+		http.Handle("/metrics", promhttp.Handler())
+		log.Fatal(http.ListenAndServe(":2112", nil))
+	}()
+
 	listener, err := net.Listen("tcp", ":3333")
 	if err != nil {
 		log.Fatalf("Failed to start server: %v", err)
