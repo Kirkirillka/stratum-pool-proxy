@@ -1,0 +1,12 @@
+{
+    "pools": [
+      {
+        "address": "sha256.poolbinance.com:443",
+        "proportion": 50
+      },
+      {
+        "address": "ru.btc.viabtc.io:3333",
+        "proportion": 50
+      }
+    ]
+  }
