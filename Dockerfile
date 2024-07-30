@@ -14,7 +14,7 @@ RUN go mod download
 COPY . .
 
 # Build the Go app
-RUN go build -o stratum-proxy
+RUN CGO_ENABLED=0 GOOS=linux go build -o stratum-proxy
 
 # Start a new stage from scratch
 FROM debian:bullseye-slim

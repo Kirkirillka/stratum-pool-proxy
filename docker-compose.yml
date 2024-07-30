@@ -1,0 +1,10 @@
+services:
+  stratum-pool-proxy:
+    build: .
+
+    ports:
+      - 3333:3333
+      - 2112:2112 
+
+    environment:
+      LOG_MESSAGES: true
